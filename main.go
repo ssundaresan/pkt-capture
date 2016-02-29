@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -11,22 +13,34 @@ import (
 	"time"
 )
 
-var stopChan = make(chan bool, 1)
-var startChan = make(chan string, 1)
-var done = make(chan error, 1)
-var pcapDir = "/tmp/pcapDir"
-
-func InitCmd(name string) *exec.Cmd {
-	return exec.Command("/opt/local/sbin/tcpdump", "-i", "en0", "-w", pcapDir+"/"+name, "-s", "100")
+type CaptureConf struct {
+	TcpdumpBin string `json:"tcpdump_bin"`
+	Interface  string `json:"interface"`
+	OutDir     string `json:"out_dir"`
+	CapSize    int    `json:"cap_size"`
+	HTTPPort   int    `json:"http_port"`
+	StartChan  chan string
+	StopChan   chan bool
+	DoneChan   chan error
 }
 
-func HandleTasks() {
+func (conf *CaptureConf) InitCmd(name string) *exec.Cmd {
+	if conf.TcpdumpBin == "" || conf.Interface == "" || name == "" {
+		log.Fatal("bad conf")
+	}
+	if conf.CapSize == 0 {
+		conf.CapSize = 100
+	}
+	return exec.Command(conf.TcpdumpBin, "-i", conf.Interface, "-w", conf.OutDir+"/"+name, "-s", fmt.Sprintf("%d", conf.CapSize))
+}
+
+func (conf *CaptureConf) HandleTasks() {
 	var cmd *exec.Cmd
 	for {
 		select {
-		case name := <-startChan:
+		case name := <-conf.StartChan:
 			fmt.Printf("received start\n")
-			cmd = InitCmd(name)
+			cmd = conf.InitCmd(name)
 			if cmd.Process != nil {
 				fmt.Printf("Already running\n")
 				continue
@@ -37,10 +51,10 @@ func HandleTasks() {
 				log.Fatal("failed to start")
 			}
 			go func() {
-				done <- cmd.Wait()
+				conf.DoneChan <- cmd.Wait()
 			}()
-			fmt.Printf("%#v \n", cmd.Process)
-		case <-stopChan:
+			fmt.Printf("Started %#v \n", cmd.Process)
+		case <-conf.StopChan:
 			log.Printf("received stop")
 			if cmd == nil || cmd.Process == nil {
 				continue
@@ -50,7 +64,7 @@ func HandleTasks() {
 			} else {
 				fmt.Printf("Couldn't kill %#v\n", err)
 			}
-		case err := <-done:
+		case err := <-conf.DoneChan:
 			log.Printf("Done")
 			if err != nil {
 				fmt.Printf("failed to die properly %#v\n", err)
@@ -59,32 +73,43 @@ func HandleTasks() {
 	}
 }
 
-func CaptureStop(w http.ResponseWriter, r *http.Request) {
-	stopChan <- true
+func (conf *CaptureConf) CaptureStop(w http.ResponseWriter, r *http.Request) {
+	conf.StopChan <- true
 }
 
-func CaptureFiles(w http.ResponseWriter, r *http.Request) {
+func (conf *CaptureConf) CaptureFiles(w http.ResponseWriter, r *http.Request) {
 	_, f := path.Split(r.URL.Path)
 	if len(f) > 0 {
-		fn := pcapDir + "/" + f
+		fn := conf.OutDir + "/" + f
 		http.ServeFile(w, r, fn)
 		os.Remove(fn)
 	}
 }
 
-func CaptureStart(w http.ResponseWriter, r *http.Request) {
-	fmt.Printf("get %#v", r.Body)
+func (conf *CaptureConf) CaptureStart(w http.ResponseWriter, r *http.Request) {
 	fn := fmt.Sprintf("%x.pcap", time.Now().UnixNano())
-	startChan <- fn
+	conf.StartChan <- fn
 	fmt.Fprintf(w, fn)
 }
 
 func main() {
-	stopChan = make(chan bool, 1)
-	http.HandleFunc("/capture_start", CaptureStart)
-	http.HandleFunc("/capture_stop", CaptureStop)
-	http.HandleFunc("/capture_files/", CaptureFiles)
+	conf := new(CaptureConf)
 
-	go HandleTasks()
+	confFile, err := ioutil.ReadFile("input.conf")
+	if err != nil {
+		log.Fatal("opening conf file: ", err.Error())
+	}
+	err = json.Unmarshal(confFile, &conf)
+	fmt.Printf("Conf%#v\n", conf)
+
+	conf.StopChan = make(chan bool, 1)
+	conf.StartChan = make(chan string, 1)
+	conf.DoneChan = make(chan error, 1)
+
+	http.HandleFunc("/capture_start", conf.CaptureStart)
+	http.HandleFunc("/capture_stop", conf.CaptureStop)
+	http.HandleFunc("/capture_files/", conf.CaptureFiles)
+
+	go conf.HandleTasks()
 	log.Fatal(http.ListenAndServe("0.0.0.0:9000", nil))
 }
